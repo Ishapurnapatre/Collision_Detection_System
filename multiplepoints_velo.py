@@ -1,0 +1,181 @@
+from collections import defaultdict
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import pandas as pd
+
+class ObjectTracker:
+    def __init__(self, video_path, output_video_path, model_path='yolov8_aug.pt'):
+        self.video_path = video_path
+        self.output_video_path = output_video_path
+        self.model = YOLO(model_path)
+        self.cap = cv2.VideoCapture(video_path)
+        self.frame_rate = self.cap.get(cv2.CAP_PROP_FPS)
+        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.out = None
+        self.frame_count = 0
+        
+        self.track_history = defaultdict(list)
+        self.track_velocities = defaultdict(list)
+        self.track_distances = defaultdict(list)
+        self.first_frame_id = defaultdict(int)
+        self.track_classes = defaultdict(str)
+        self.prev_avg_positions = defaultdict(lambda: (0, 0))  # Store previous average positions
+
+    def run_tracking(self):
+        if not self.cap.isOpened():
+            print("Error opening video stream or file")
+            return
+        
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        self.out = cv2.VideoWriter(self.output_video_path, fourcc, self.frame_rate, (self.frame_width, self.frame_height))
+        
+        while self.cap.isOpened():
+            success, frame = self.cap.read()
+            self.frame_count += 1
+            
+            if not success:
+                break
+            
+            annotated_frame = self.process_frame(frame)
+            
+            self.out.write(annotated_frame)
+            cv2.imshow("YOLOv8 Tracking", annotated_frame)
+            
+            if cv2.waitKey(100) & 0xFF == ord('q'):
+                break
+        
+        self.cap.release()
+        self.out.release()
+        cv2.destroyAllWindows()
+        
+        self.save_tracking_data()
+
+    def process_frame(self, frame):
+        results = self.model.track(frame, persist=True)
+        annotated_frame = frame.copy()
+        
+        if results and hasattr(results[0], 'boxes') and results[0].boxes:
+            boxes = results[0].boxes
+            
+            if hasattr(boxes, 'xywh') and hasattr(boxes, 'id') and boxes.id is not None:
+                annotated_frame = results[0].plot()
+                self.update_tracks(boxes, annotated_frame)
+        
+        return annotated_frame
+    
+    def update_tracks(self, boxes, annotated_frame):
+        track_ids = boxes.id.int().cpu().tolist()
+        boxes_xywh = boxes.xywh.cpu().numpy()
+        class_names = [self.model.names[i] for i in boxes.cls.int().cpu().tolist()]
+        
+        for box, track_id, class_name in zip(boxes_xywh, track_ids, class_names):
+            x, y, w, h = box
+            track = self.track_history[track_id]
+            
+            if track_id not in self.first_frame_id:
+                self.first_frame_id[track_id] = self.frame_count
+                self.track_classes[track_id] = class_name
+            
+            if track:
+                closest_point, closest_distance = self.find_closest_point(track[-1], box)
+                if closest_point is None:
+                    closest_point = (x + w // 2, y + h // 2)  # Center of the box as fallback
+                    closest_distance = 0.0  # No distance if closest point not found
+                
+                cumulative_distance = self.track_distances[track_id][-1] + closest_distance if self.track_distances[track_id] else closest_distance
+                time_elapsed = (self.frame_count - self.first_frame_id[track_id] + 1) / self.frame_rate
+                cumulative_velocity = cumulative_distance / time_elapsed if time_elapsed > 0 else 0
+                
+                prev_avg_x, prev_avg_y = self.prev_avg_positions[track_id]
+                avg_x = (prev_avg_x + closest_point[0]) / 2
+                avg_y = (prev_avg_y + closest_point[1]) / 2
+                
+                cumulative_velocity_avg = self.calculate_velocity_avg(prev_avg_x, prev_avg_y, avg_x, avg_y, time_elapsed)
+                self.track_velocities[track_id].append(cumulative_velocity_avg)
+                
+                self.prev_avg_positions[track_id] = (avg_x, avg_y)  # Update previous average positions
+                
+                self.track_distances[track_id].append(cumulative_distance)
+                
+                # Print closest point, distance, and velocities
+                print(f"Track ID {track_id}: Closest Point = {closest_point}, Distance = {closest_distance:.2f} px, Velocity = {cumulative_velocity_avg:.2f} px/s")
+                
+                # Display velocity text
+                self.display_velocity_text(annotated_frame, track_id, cumulative_velocity_avg, closest_point[0], closest_point[1])
+            else:
+                cumulative_velocity = 0.0
+                self.track_velocities[track_id].append(cumulative_velocity)
+                self.track_distances[track_id].append(0.0)
+            
+            track.append((x, y))
+
+    
+    def find_closest_point(self, prev_point, box):
+        x, y, w, h = box
+        box_center = (x + w // 2, y + h // 2)
+        corners = [(x, y), (x + w, y), (x, y + h), (x + w, y + h)]
+        
+        closest_point = None
+        min_distance = float('inf')
+        
+        for corner in corners:
+            distance = np.sqrt((corner[0] - prev_point[0]) ** 2 + (corner[1] - prev_point[1]) ** 2)
+            if distance < min_distance:
+                min_distance = distance
+                closest_point = corner
+        
+        return closest_point, min_distance
+    
+    def calculate_velocity_avg(self, prev_avg_x, prev_avg_y, avg_x, avg_y, time_elapsed):
+        distance_avg = np.sqrt((avg_x - prev_avg_x) ** 2 + (avg_y - prev_avg_y) ** 2)
+        return distance_avg / time_elapsed if time_elapsed > 0 else 0
+    
+    def display_velocity_text(self, annotated_frame, track_id, velocity, x, y):
+        text = f"Velocity: {velocity:.2f} px/s"
+        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        text_width, text_height = text_size[0]
+        cv2.rectangle(annotated_frame, (int(x), int(y - text_height - 6)), (int(x + text_width), int(y)), (0, 0, 0), -1)
+        cv2.putText(annotated_frame, text, (int(x), int(y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Calculate and display distance
+        if track_id in self.track_distances:
+            distance = self.track_distances[track_id][-1]  # Get the latest recorded distance
+            distance_text = f"Distance: {distance:.2f} px"
+            cv2.putText(annotated_frame, distance_text, (int(x), int(y + 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Mark the closest point (assuming (x, y) is the point of interest)
+        cv2.circle(annotated_frame, (int(x), int(y)), 5, (0, 255, 0), -1)  # Green circle at the tracking point
+
+    def save_tracking_data(self):
+        max_frame = self.frame_count
+        frame_data = {'Frame': list(range(1, max_frame + 1))}
+        
+        for id_, first_frame in self.first_frame_id.items():
+            class_name = self.track_classes[id_]
+            velocity_col = f'ID {id_} {class_name} Velocity (px/s)'
+            distance_col = f'ID {id_} {class_name} Distance (px)'
+            
+            velocities = [None] * (first_frame - 1) + self.track_velocities[id_]
+            distances = [None] * (first_frame - 1) + self.track_distances[id_]
+            
+            velocities.extend([None] * (max_frame - len(velocities)))
+            distances.extend([None] * (max_frame - len(distances)))
+            
+            frame_data[velocity_col] = velocities
+            frame_data[distance_col] = distances
+        
+        df = pd.DataFrame(frame_data)
+        excel_path = 'Dynamic_test2_velocity_with_id1.xlsx'
+        df.to_excel(excel_path, index=False)
+
+def main():
+    video_path = "Distance_Estimation.mp4"
+    output_video_path = "Output_Dynamic_test15.mp4"
+    
+    tracker = ObjectTracker(video_path, output_video_path)
+    tracker.run_tracking()
+
+if __name__ == "__main__":
+    main()
